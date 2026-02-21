@@ -282,8 +282,12 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class GroupedExpertsTE:
         pass
 
+    class GroupedExpertsFP8:
+        pass
+
     experts_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
+    experts_stub.GroupedExpertsFP8 = GroupedExpertsFP8
     monkeypatch.setitem(
         sys.modules, "nemo_automodel.components.moe.experts", experts_stub
     )

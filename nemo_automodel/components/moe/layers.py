@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    GroupedExpertsFP8,
     GroupedExpertsTE,
     is_gated_activation,
 )
@@ -558,6 +559,8 @@ class MoE(nn.Module):
             else:
                 # experts == "te"
                 self.experts = GroupedExpertsTE(config, backend=backend)
+        elif backend.native_fp8_experts and backend.experts in ("torch_mm", "torch"):
+            self.experts = GroupedExpertsFP8(config, backend=backend)
         else:
             # Default to torch experts
             self.experts = GroupedExperts(config, backend=backend)
@@ -650,7 +653,7 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
                 to_local(module.bias).zero_()
-        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
+        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsFP8, GroupedExpertsTE)):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
         elif isinstance(module, MLP):

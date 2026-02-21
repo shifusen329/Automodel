@@ -176,6 +176,7 @@ class BackendConfig:
     fake_gate_noise: float = 0.0
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
+    native_fp8_experts: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
 

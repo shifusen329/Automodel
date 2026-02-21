@@ -475,6 +475,291 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+class GroupedExpertsFP8(nn.Module):
+    """MoE experts with native FP8 weight storage.
+
+    Stores expert weights as float8_e4m3fn with block-wise scale_inv buffers.
+    Dequantizes to the compute dtype before GEMM. Expert weights are frozen
+    (requires_grad=False) for LoRA fine-tuning scenarios.
+
+    Supports two compute paths:
+    - torch._grouped_mm (backend.experts="torch_mm"): batch-dequantize all experts
+    - Per-expert loop (backend.experts="torch"): dequantize per-expert inside loop
+    """
+
+    def __init__(self, config: MoEConfig, backend: Optional["BackendConfig"] = None):
+        super().__init__()
+        self.config = config
+        self.n_routed_experts = config.n_routed_experts
+        self.expert_bias = config.expert_bias
+        self.is_gated = is_gated_activation(config.expert_activation)
+        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        self.compute_dtype = config.dtype
+
+        up_proj_dim = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
+
+        # FP8 expert weight parameters (frozen for LoRA)
+        self.gate_and_up_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, up_proj_dim, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        self.down_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+
+        # Block-wise scale_inv buffers (float32, small relative to weights)
+        # Shapes based on 128x128 block quantization of the weight matrices
+        gate_up_scale_rows = (config.dim + 127) // 128
+        gate_up_scale_cols = (up_proj_dim + 127) // 128
+        down_scale_rows = (config.moe_inter_dim + 127) // 128
+        down_scale_cols = (config.dim + 127) // 128
+
+        self.register_buffer(
+            "gate_and_up_scale_inv",
+            torch.ones(config.n_routed_experts, gate_up_scale_rows, gate_up_scale_cols, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "down_scale_inv",
+            torch.ones(config.n_routed_experts, down_scale_rows, down_scale_cols, dtype=torch.float32),
+        )
+
+        if self.expert_bias:
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype)
+            )
+            self.down_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype)
+            )
+        else:
+            self.gate_up_proj_bias = None
+            self.down_proj_bias = None
+
+        self.expert_activation_grouped = get_expert_activation_for_deepep(config)
+
+    def _dequantize_weight(self, fp8_weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+        """Dequantize a single expert's FP8 weight using its scale_inv.
+
+        Args:
+            fp8_weight: [rows, cols] float8_e4m3fn weight
+            scale_inv: [scale_rows, scale_cols] float32 block-wise scales
+
+        Returns:
+            Dequantized weight in compute_dtype
+        """
+        from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
+
+        return dequantize_from_fp8(fp8_weight, scale_inv, dtype=self.compute_dtype)
+
+    def _dequantize_all_experts(
+        self, fp8_weights: torch.Tensor, scale_inv: torch.Tensor
+    ) -> torch.Tensor:
+        """Dequantize all experts' weights batch-wise.
+
+        Args:
+            fp8_weights: [n_experts, rows, cols] float8_e4m3fn
+            scale_inv: [n_experts, scale_rows, scale_cols] float32
+
+        Returns:
+            [n_experts, rows, cols] in compute_dtype
+        """
+        n = fp8_weights.shape[0]
+        dequantized = []
+        for i in range(n):
+            dequantized.append(self._dequantize_weight(fp8_weights[i], scale_inv[i]))
+        return torch.stack(dequantized, dim=0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        assert not isinstance(x, DTensor)
+        input_dtype = x.dtype
+
+        if isinstance(self.gate_and_up_projs, DTensor):
+            ep_mesh = self.gate_and_up_projs.device_mesh
+            ep_size = ep_mesh.size()
+            ep_rank = ep_mesh.get_local_rank()
+        else:
+            ep_mesh = None
+            ep_size = 1
+            ep_rank = 0
+
+        assert self.n_routed_experts % ep_size == 0
+
+        gate_and_up_projs_fp8 = (
+            self.gate_and_up_projs.to_local() if isinstance(self.gate_and_up_projs, DTensor) else self.gate_and_up_projs
+        )
+        down_projs_fp8 = self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs
+
+        gate_and_up_scale = (
+            self.gate_and_up_scale_inv.to_local()
+            if isinstance(self.gate_and_up_scale_inv, DTensor)
+            else self.gate_and_up_scale_inv
+        )
+        down_scale = (
+            self.down_scale_inv.to_local() if isinstance(self.down_scale_inv, DTensor) else self.down_scale_inv
+        )
+
+        if ep_size > 1:
+            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
+            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
+            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+
+        n_local_experts = self.n_routed_experts // ep_size
+        experts_start_idx = ep_rank * n_local_experts
+
+        if self.use_torch_mm:
+            y = self._forward_grouped_mm(
+                x, token_mask, weights, indices,
+                gate_and_up_projs_fp8, down_projs_fp8,
+                gate_and_up_scale, down_scale,
+                n_local_experts, experts_start_idx,
+            )
+        else:
+            y = self._forward_loop(
+                x, weights, indices, token_mask,
+                gate_and_up_projs_fp8, down_projs_fp8,
+                gate_and_up_scale, down_scale,
+                n_local_experts, experts_start_idx,
+                experts_start_idx + n_local_experts,
+            )
+
+        if ep_size > 1:
+            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
+            y = y.redistribute(placements=[Shard(0)]).to_local()
+
+        return y.to(input_dtype)
+
+    def _forward_loop(
+        self, x, weights, indices, token_mask,
+        gate_and_up_projs_fp8, down_projs_fp8,
+        gate_and_up_scale, down_scale,
+        n_local_experts, experts_start_idx, experts_end_idx,
+    ):
+        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        active_local_experts = 0
+
+        for i in range(experts_start_idx, experts_end_idx):
+            indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
+            idx, top = torch.where(indices_mask)
+
+            if idx.numel() == 0:
+                continue
+            active_local_experts += 1
+
+            local_idx = i - experts_start_idx
+
+            # Dequantize only the active expert's weights
+            gate_and_up_proj = self._dequantize_weight(
+                gate_and_up_projs_fp8[local_idx], gate_and_up_scale[local_idx]
+            )
+            down_proj = self._dequantize_weight(
+                down_projs_fp8[local_idx], down_scale[local_idx]
+            )
+
+            down_proj_bias = self.down_proj_bias[local_idx] if self.expert_bias else None
+            idx_b = idx[:, None].expand(-1, x.size(1))
+            x_idx = x.gather(dim=0, index=idx_b)
+
+            gate_up_proj_bias = self.gate_up_proj_bias[local_idx] if self.expert_bias else None
+            gate_and_up_out = x_idx @ gate_and_up_proj
+            if gate_up_proj_bias is not None:
+                gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+
+            w = weights[idx, top, None]
+            activated = self.expert_activation_grouped(gate_and_up_out, w)
+
+            expert_out = activated @ down_proj
+            if down_proj_bias is not None:
+                expert_out = expert_out + down_proj_bias * w
+
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+
+        if active_local_experts == 0:
+            # Dequantize first expert for dummy gradient flow
+            gate_and_up_proj = self._dequantize_weight(
+                gate_and_up_projs_fp8[0], gate_and_up_scale[0]
+            )
+            down_proj = self._dequantize_weight(down_projs_fp8[0], down_scale[0])
+            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
+            gate_and_up_out = dummy_x @ gate_and_up_proj
+            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
+            expert_out = activated @ down_proj
+            y[0] += expert_out[0]
+
+        return y
+
+    def _forward_grouped_mm(
+        self, x, token_mask, weights, indices,
+        gate_and_up_projs_fp8, down_projs_fp8,
+        gate_and_up_scale, down_scale,
+        n_local_experts, experts_start_idx,
+    ):
+        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts, experts_start_idx,
+        )
+
+        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+
+        if tokens_per_expert.sum() > 0:
+            # Batch-dequantize all experts upfront for grouped GEMM
+            gate_and_up_projs = self._dequantize_all_experts(
+                gate_and_up_projs_fp8, gate_and_up_scale
+            )
+            down_projs = self._dequantize_all_experts(down_projs_fp8, down_scale)
+
+            permuted_x = x[sorted_token_ids]
+            permuted_probs = sorted_weights.unsqueeze(-1)
+
+            if self.expert_bias:
+                gate_up_proj_bias = (
+                    self.gate_up_proj_bias.to_local()
+                    if isinstance(self.gate_up_proj_bias, DTensor)
+                    else self.gate_up_proj_bias
+                )
+                down_proj_bias = (
+                    self.down_proj_bias.to_local()
+                    if isinstance(self.down_proj_bias, DTensor)
+                    else self.down_proj_bias
+                )
+                output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                output1 = self.expert_activation_grouped(output1, permuted_probs)
+                output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+                output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
+            else:
+                output2 = _torch_mm_experts_fwd(
+                    permuted_x, gate_and_up_projs, down_projs,
+                    tokens_per_expert, permuted_probs, self.expert_activation_grouped,
+                )
+
+            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+            y.scatter_add_(0, scatter_ids, output2.float())
+        else:
+            gate_and_up_proj = self._dequantize_weight(
+                gate_and_up_projs_fp8[0], gate_and_up_scale[0]
+            )
+            down_proj = self._dequantize_weight(down_projs_fp8[0], down_scale[0])
+            output1 = torch.matmul(x[0] * 0, gate_and_up_proj)
+            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
+            output2 = torch.matmul(output1_, down_proj)
+            y[0] += output2[0]
+
+        return y
+
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
+        pass  # FP8 weights are loaded from checkpoint, not randomly initialized
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -1108,7 +1393,12 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             return tensor
 
     with torch.device(buffer_device):
-        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
+        if isinstance(module, GroupedExpertsFP8):
+            # FP8 weights are loaded from checkpoint, not randomly initialized
+            if module.expert_bias:
+                to_local(module.gate_up_proj_bias).zero_()
+                to_local(module.down_proj_bias).zero_()
+        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
             to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
             to_local(module.down_projs).normal_(mean=0.0, std=init_std)
             if module.expert_bias:

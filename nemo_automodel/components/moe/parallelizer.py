@@ -30,7 +30,7 @@ from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsFP8, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
     MoE,
 )
@@ -197,14 +197,31 @@ def apply_fsdp(
     for _, block in _model.layers.named_children():
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE) and ep_shard_enabled:
-            # Apply FSDP on dim=1 for grouped experts since we may have more
-            # shards than experts (dim=0).
-            fully_shard(
-                moe_module.experts,
-                mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
-                reshard_after_forward=reshard_after_forward,
-            )
+            if isinstance(moe_module.experts, GroupedExpertsFP8):
+                # Use param_dtype=None to preserve FP8 during FSDP all-gather
+                # (50% bandwidth reduction vs bf16). Scale_inv buffers stay replicated.
+                fp8_mp_policy = MixedPrecisionPolicy(
+                    param_dtype=None,
+                    reduce_dtype=torch.float32,
+                    output_dtype=torch.bfloat16,
+                    cast_forward_inputs=True,
+                )
+                fully_shard(
+                    moe_module.experts,
+                    mesh=ep_shard_mesh,
+                    shard_placement_fn=lambda _: Shard(1),
+                    reshard_after_forward=reshard_after_forward,
+                    mp_policy=fp8_mp_policy,
+                )
+            else:
+                # Apply FSDP on dim=1 for grouped experts since we may have more
+                # shards than experts (dim=0).
+                fully_shard(
+                    moe_module.experts,
+                    mesh=ep_shard_mesh,
+                    shard_placement_fn=lambda _: Shard(1),
+                    reshard_after_forward=reshard_after_forward,
+                )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
         # from FSDP for the transformer block.
